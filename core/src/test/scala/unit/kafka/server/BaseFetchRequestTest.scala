@@ -33,7 +33,7 @@ import scala.jdk.CollectionConverters._
 
 class BaseFetchRequestTest extends BaseRequestTest {
 
-  protected var producer: KafkaProducer[String, String] = null
+  protected var producer: KafkaProducer[String, String] = _
 
   override def brokerPropertyOverrides(properties: Properties): Unit = {
     properties.put(KafkaConfig.FetchMaxBytes, Int.MaxValue.toString)
@@ -46,10 +46,16 @@ class BaseFetchRequestTest extends BaseRequestTest {
     super.tearDown()
   }
 
-  protected def createFetchRequest(maxResponseBytes: Int, maxPartitionBytes: Int, topicPartitions: Seq[TopicPartition],
-                                   offsetMap: Map[TopicPartition, Long],
-                                   version: Short): FetchRequest = {
-    FetchRequest.Builder.forConsumer(version, Int.MaxValue, 0, createPartitionMap(maxPartitionBytes, topicPartitions, offsetMap))
+  protected def createConsumerFetchRequest(
+    maxResponseBytes: Int,
+    maxPartitionBytes: Int,
+    topicPartitions: Seq[TopicPartition],
+    offsetMap: Map[TopicPartition, Long],
+    version: Short,
+    maxWaitMs: Int = Int.MaxValue,
+    minBytes: Int = 0
+  ): FetchRequest = {
+    FetchRequest.Builder.forConsumer(version, maxWaitMs, minBytes, createPartitionMap(maxPartitionBytes, topicPartitions, offsetMap))
       .setMaxBytes(maxResponseBytes).build()
   }
 
@@ -64,12 +70,12 @@ class BaseFetchRequestTest extends BaseRequestTest {
     partitionMap
   }
 
-  protected def sendFetchRequest(leaderId: Int, request: FetchRequest): FetchResponse = {
-    connectAndReceive[FetchResponse](request, destination = brokerSocketServer(leaderId))
+  protected def sendFetchRequest(brokerId: Int, request: FetchRequest): FetchResponse = {
+    connectAndReceive[FetchResponse](request, destination = brokerSocketServer(brokerId))
   }
 
   protected def initProducer(): Unit = {
-    producer = TestUtils.createProducer(TestUtils.getBrokerListStrFromServers(servers),
+    producer = TestUtils.createProducer(bootstrapServers(),
       keySerializer = new StringSerializer, valueSerializer = new StringSerializer)
   }
 

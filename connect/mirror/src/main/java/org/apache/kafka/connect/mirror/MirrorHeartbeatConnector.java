@@ -19,6 +19,7 @@ package org.apache.kafka.connect.mirror;
 import org.apache.kafka.connect.connector.Task;
 import org.apache.kafka.connect.source.SourceConnector;
 import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.utils.AppInfoParser;
 import org.apache.kafka.common.utils.Utils;
 
 import java.util.Map;
@@ -75,11 +76,11 @@ public class MirrorHeartbeatConnector extends SourceConnector {
 
     @Override
     public String version() {
-        return "1";
+        return AppInfoParser.getVersion();
     }
 
     private void createInternalTopics() {
         MirrorUtils.createSinglePartitionCompactedTopic(config.heartbeatsTopic(),
-            config.heartbeatsTopicReplicationFactor(), config.targetAdminConfig());
+            config.heartbeatsTopicReplicationFactor(), config.forwardingAdmin(config.targetAdminConfig()));
     }
 }
