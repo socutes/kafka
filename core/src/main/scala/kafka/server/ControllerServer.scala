@@ -17,11 +17,9 @@
 
 package kafka.server
 
-import java.util.OptionalLong
-import java.util.concurrent.locks.ReentrantLock
-import java.util.concurrent.{CompletableFuture, TimeUnit}
 import kafka.cluster.Broker.ServerInfo
 import kafka.metrics.{KafkaMetricsGroup, LinuxIoMetricsCollector}
+import kafka.migration.MigrationPropagator
 import kafka.network.{DataPlaneAcceptor, SocketServer}
 import kafka.raft.KafkaRaftManager
 import kafka.security.CredentialProvider
@@ -29,6 +27,8 @@ import kafka.server.KafkaConfig.{AlterConfigPolicyClassNameProp, CreateTopicPoli
 import kafka.server.KafkaRaftServer.BrokerRole
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.utils.{CoreUtils, Logging}
+import kafka.zk.{KafkaZkClient, ZkMigrationClient}
+import org.apache.kafka.common.config.ConfigException
 import org.apache.kafka.common.message.ApiMessageType.ListenerType
 import org.apache.kafka.common.security.scram.internals.ScramMechanism
 import org.apache.kafka.common.security.token.delegation.internals.DelegationTokenCache
@@ -36,17 +36,40 @@ import org.apache.kafka.common.utils.LogContext
 import org.apache.kafka.common.{ClusterResource, Endpoint}
 import org.apache.kafka.controller.{Controller, QuorumController, QuorumFeatures}
 import org.apache.kafka.metadata.KafkaConfigSchema
+import org.apache.kafka.metadata.authorizer.ClusterMetadataAuthorizer
+import org.apache.kafka.metadata.bootstrap.BootstrapMetadata
+import org.apache.kafka.metadata.migration.{KRaftMigrationDriver, LegacyPropagator}
 import org.apache.kafka.raft.RaftConfig
 import org.apache.kafka.server.authorizer.Authorizer
 import org.apache.kafka.server.common.ApiMessageAndVersion
-import org.apache.kafka.common.config.ConfigException
-import org.apache.kafka.metadata.authorizer.ClusterMetadataAuthorizer
-import org.apache.kafka.metadata.bootstrap.BootstrapMetadata
 import org.apache.kafka.server.metrics.KafkaYammerMetrics
 import org.apache.kafka.server.policy.{AlterConfigPolicy, CreateTopicPolicy}
+import org.apache.kafka.server.util.{Deadline, FutureUtils}
 
-import scala.jdk.CollectionConverters._
+import java.util.OptionalLong
+import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.{CompletableFuture, TimeUnit}
 import scala.compat.java8.OptionConverters._
+import scala.jdk.CollectionConverters._
+
+
+case class ControllerMigrationSupport(
+  zkClient: KafkaZkClient,
+  migrationDriver: KRaftMigrationDriver,
+  brokersRpcClient: LegacyPropagator
+) {
+  def shutdown(logging: Logging): Unit = {
+    if (zkClient != null) {
+      CoreUtils.swallow(zkClient.close(), logging)
+    }
+    if (brokersRpcClient != null) {
+      CoreUtils.swallow(brokersRpcClient.shutdown(), logging)
+    }
+    if (migrationDriver != null) {
+      CoreUtils.swallow(migrationDriver.close(), logging)
+    }
+  }
+}
 
 /**
  * A Kafka controller that runs in KRaft (Kafka Raft) mode.
@@ -81,6 +104,7 @@ class ControllerServer(
   var quotaManagers: QuotaManagers = _
   var controllerApis: ControllerApis = _
   var controllerApisHandlerPool: KafkaRequestHandlerPool = _
+  var migrationSupport: Option[ControllerMigrationSupport] = None
 
   private def maybeChangeStatus(from: ProcessStatus, to: ProcessStatus): Boolean = {
     lock.lock()
@@ -105,6 +129,7 @@ class ControllerServer(
 
   def startup(): Unit = {
     if (!maybeChangeStatus(SHUTDOWN, STARTING)) return
+    val startupDeadline = Deadline.fromDelay(time, config.serverMaxStartupTimeMs, TimeUnit.MILLISECONDS)
     try {
       info("Starting controller")
       config.dynamicConfig.initialize(zkClientOpt = None)
@@ -145,7 +170,10 @@ class ControllerServer(
           }.toMap
       }
 
-      val apiVersionManager = new SimpleApiVersionManager(ListenerType.CONTROLLER)
+      val apiVersionManager = new SimpleApiVersionManager(
+        ListenerType.CONTROLLER,
+        config.unstableApiVersionsEnabled
+      )
 
       tokenCache = new DelegationTokenCache(ScramMechanism.mechanismNames)
       credentialProvider = new CredentialProvider(ScramMechanism.mechanismNames, tokenCache)
@@ -169,7 +197,11 @@ class ControllerServer(
       alterConfigPolicy = Option(config.
         getConfiguredInstance(AlterConfigPolicyClassNameProp, classOf[AlterConfigPolicy]))
 
-      val controllerNodes = RaftConfig.voterConnectionsToNodes(sharedServer.controllerQuorumVotersFuture.get())
+      val voterConnections = FutureUtils.waitWithLogging(logger.underlying,
+        "controller quorum voters future",
+        sharedServer.controllerQuorumVotersFuture,
+        startupDeadline, time)
+      val controllerNodes = RaftConfig.voterConnectionsToNodes(voterConnections)
       val quorumFeatures = QuorumFeatures.create(config.nodeId,
         sharedServer.raftManager.apiVersions,
         QuorumFeatures.defaultFeatureMap(),
@@ -194,8 +226,6 @@ class ControllerServer(
           setDefaultNumPartitions(config.numPartitions.intValue()).
           setSessionTimeoutNs(TimeUnit.NANOSECONDS.convert(config.brokerSessionTimeoutMs.longValue(),
             TimeUnit.MILLISECONDS)).
-          setSnapshotMaxNewRecordBytes(config.metadataSnapshotMaxNewRecordBytes).
-          setSnapshotMaxIntervalMs(config.metadataSnapshotMaxIntervalMs).
           setLeaderImbalanceCheckIntervalNs(leaderImbalanceCheckIntervalNs).
           setMaxIdleIntervalNs(maxIdleIntervalNs).
           setMetrics(sharedServer.controllerMetrics).
@@ -216,6 +246,26 @@ class ControllerServer(
       // Perform any setup that is done only when this node is a controller-only node.
       if (!config.processRoles.contains(BrokerRole)) {
         doRemoteKraftSetup()
+      }
+
+      if (config.migrationEnabled) {
+        val zkClient = KafkaZkClient.createZkClient("KRaft Migration", time, config, KafkaServer.zkClientConfigFromKafkaConfig(config))
+        val migrationClient = new ZkMigrationClient(zkClient)
+        val propagator: LegacyPropagator = new MigrationPropagator(config.nodeId, config)
+        val migrationDriver = new KRaftMigrationDriver(
+          config.nodeId,
+          controller.asInstanceOf[QuorumController].zkRecordConsumer(),
+          migrationClient,
+          propagator,
+          publisher => sharedServer.loader.installPublishers(java.util.Collections.singletonList(publisher)),
+          sharedServer.faultHandlerFactory.build(
+            "zk migration",
+            fatal = false,
+            () => {}
+          )
+        )
+        migrationDriver.start()
+        migrationSupport = Some(ControllerMigrationSupport(zkClient, migrationDriver, propagator))
       }
 
       quotaManagers = QuotaFactory.instantiate(config,
@@ -249,7 +299,16 @@ class ControllerServer(
        * metadata log. See @link{QuorumController#maybeCompleteAuthorizerInitialLoad}
        * and KIP-801 for details.
        */
-      socketServer.enableRequestProcessing(authorizerFutures)
+      val socketServerFuture = socketServer.enableRequestProcessing(authorizerFutures)
+
+      // Block here until all the authorizer futures are complete
+      FutureUtils.waitWithLogging(logger.underlying, "all of the authorizer futures to be completed",
+        CompletableFuture.allOf(authorizerFutures.values.toSeq: _*), startupDeadline, time)
+
+      // Wait for all the SocketServer ports to be open, and the Acceptors to be started.
+      FutureUtils.waitWithLogging(logger.underlying, "all of the SocketServer Acceptors to be started",
+        socketServerFuture, startupDeadline, time)
+
     } catch {
       case e: Throwable =>
         maybeChangeStatus(STARTING, STARTED)
@@ -268,6 +327,7 @@ class ControllerServer(
       sharedServer.ensureNotRaftLeader()
       if (socketServer != null)
         CoreUtils.swallow(socketServer.stopProcessingRequests(), this)
+      migrationSupport.foreach(_.shutdown(this))
       if (controller != null)
         controller.beginShutdown()
       if (socketServer != null)

@@ -21,7 +21,7 @@ import java.io.{ByteArrayOutputStream, File, PrintStream}
 import java.net.InetSocketAddress
 import java.util
 import java.util.{Collections, Properties}
-import java.util.concurrent.CompletableFuture
+import java.util.concurrent.{CompletableFuture, TimeUnit}
 import javax.security.auth.login.Configuration
 import kafka.tools.StorageTool
 import kafka.utils.{CoreUtils, Logging, TestInfoUtils, TestUtils}
@@ -160,6 +160,10 @@ abstract class QuorumTestHarness extends Logging {
     TestInfoUtils.isKRaft(testInfo)
   }
 
+  def isZkMigrationTest(): Boolean = {
+    TestInfoUtils.isZkMigrationTest(testInfo)
+  }
+
   def checkIsZKTest(): Unit = {
     if (isKRaftTest()) {
       throw new RuntimeException("This function can't be accessed when running the test " +
@@ -291,6 +295,7 @@ abstract class QuorumTestHarness extends Logging {
       throw new RuntimeException("Only one KRaft controller is supported for now.")
     }
     val props = propsList(0)
+    props.setProperty(KafkaConfig.ServerMaxStartupTimeMsProp, TimeUnit.MINUTES.toMillis(10).toString)
     props.setProperty(KafkaConfig.ProcessRolesProp, "controller")
     if (props.getProperty(KafkaConfig.NodeIdProp) == null) {
       props.setProperty(KafkaConfig.NodeIdProp, "1000")
